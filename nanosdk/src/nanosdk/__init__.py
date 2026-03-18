@@ -15,13 +15,18 @@ from .subagent import SubagentManager
 from .tool import Tool, ToolParameterSchema
 from .types import (
     Message,
+    MessageRole,
     ToolCall,
     ToolResult,
     ExecutionResult,
     ExecutionContext,
     AgentConfig,
+    AgentStatus,
     ModelConfig,
     MemoryConfig,
+    ModelResponse,
+    StreamChunk,
+    ToolContext,
 )
 
 __all__ = [
@@ -47,14 +52,19 @@ __all__ = [
     # Tools
     "Tool",
     "ToolParameterSchema",
+    "ToolContext",
     
     # Types
     "Message",
+    "MessageRole",
     "ToolCall",
     "ToolResult",
     "ExecutionResult",
     "ExecutionContext",
     "AgentConfig",
+    "AgentStatus",
     "ModelConfig",
     "MemoryConfig",
+    "ModelResponse",
+    "StreamChunk",
 ]

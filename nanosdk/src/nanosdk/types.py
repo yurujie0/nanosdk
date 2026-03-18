@@ -29,11 +29,12 @@ class Message:
     """消息"""
     id: str
     role: MessageRole
-    content: str
+    content: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Optional[Dict[str, Any]] = None
     tool_calls: Optional[List["ToolCall"]] = None
     tool_results: Optional[List["ToolResult"]] = None
+    reasoning_content: Optional[str] = None  # 推理/思考内容
 
 
 @dataclass
@@ -42,6 +43,18 @@ class ToolCall:
     id: str
     name: str
     arguments: Dict[str, Any]
+    
+    def to_openai_tool_call(self) -> Dict[str, Any]:
+        """转换为 OpenAI 格式的 tool_call"""
+        import json
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": json.dumps(self.arguments, ensure_ascii=False)
+            }
+        }
 
 
 @dataclass
@@ -78,9 +91,12 @@ class Tool:
     
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters.to_dict(),
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters.to_dict(),
+            }
         }
 
 
@@ -132,7 +148,7 @@ class AgentConfig:
     skills: List["Skill"] = field(default_factory=list)
     memory: Optional[MemoryConfig] = None
     system_prompt: Optional[str] = None
-    max_iterations: int = 10
+    max_iterations: int = 10  # ReAct 最大迭代次数
     temperature: float = 0.7
 
 
@@ -183,10 +199,22 @@ class ExecutionResult:
 @dataclass
 class StreamChunk:
     """流式响应块"""
-    type: str  # "text", "error", "done", "tool_call"
+    type: str  # "text", "error", "done", "tool_call", "thought"
     content: Optional[str] = None
     error: Optional[str] = None
     tool_call: Optional[ToolCall] = None
+    reasoning: Optional[str] = None  # 推理内容
+
+
+@dataclass
+class ModelResponse:
+    """模型响应"""
+    content: Optional[str] = None  # 文本内容
+    tool_calls: Optional[List[ToolCall]] = None  # 工具调用
+    reasoning_content: Optional[str] = None  # 推理内容
+    thinking_blocks: Optional[List[Dict[str, Any]]] = None  # 思考块
+    has_tool_calls: bool = False  # 是否有工具调用
+    finish_reason: Optional[str] = None  # 完成原因
 
 
 @dataclass
@@ -247,94 +275,3 @@ if TYPE_CHECKING:
 else:
     AgentType = Any
     MemoryStoreType = Any
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

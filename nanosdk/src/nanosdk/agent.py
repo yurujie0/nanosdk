@@ -1,10 +1,14 @@
 """
-Agent 核心模块
+Agent 核心模块 - ReAct 范式实现
+
+参考 HKUDS/nanobot 的 ReAct 实现
 """
 
 import asyncio
+import json
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+import re
+from typing import Any, AsyncGenerator, Dict, List, Optional, Callable, Awaitable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -22,6 +26,7 @@ from .types import (
     ToolResult,
     TokenUsage,
     ModelConfig,
+    ModelResponse,
 )
 from .context import Context
 from .tool import ToolRegistry
@@ -31,9 +36,14 @@ from .context import ContextManager
 @dataclass
 class Agent:
     """
-    Agent 核心类
+    Agent 核心类 - ReAct 范式实现
     
     负责管理 Agent 的生命周期、执行流程、工具调用和状态管理
+    采用 ReAct (Reasoning + Acting) 范式：
+    - Thought: LLM 推理/思考
+    - Action: 执行工具调用
+    - Observation: 观察工具执行结果
+    - 循环直到任务完成
     """
     
     config: AgentConfig
@@ -51,20 +61,22 @@ class Agent:
             self.register_tool(tool)
     
     # ============================================
-    # 核心执行方法
+    # 核心执行方法 - ReAct 循环
     # ============================================
     
     async def execute(
         self,
         input: str,
-        context: Optional[ExecutionContext] = None
+        context: Optional[ExecutionContext] = None,
+        on_progress: Optional[Callable[[str], Awaitable[None]]] = None
     ) -> ExecutionResult:
         """
-        执行 Agent
+        执行 Agent - ReAct 范式
         
         Args:
             input: 用户输入
             context: 执行上下文
+            on_progress: 进度回调函数
             
         Returns:
             ExecutionResult: 执行结果
@@ -78,20 +90,18 @@ class Agent:
             # 创建执行上下文
             exec_context = self._create_execution_context(context, session_id)
             
-            # 构建消息列表
-            messages = self._build_messages(input, exec_context)
+            # 构建初始消息列表
+            messages = self._build_initial_messages(input, exec_context)
             
-            # 调用模型获取响应
-            response = await self._call_model(messages)
-            
-            # 处理工具调用
-            tool_calls, tool_results = await self._process_tools(response, exec_context)
-            
-            # 构建输出
-            output = self._build_output(response, tool_results)
+            # 运行 ReAct 循环
+            final_content, all_tool_calls, all_tool_results, final_messages = await self._run_react_loop(
+                messages=messages,
+                max_iterations=self.config.max_iterations,
+                on_progress=on_progress
+            )
             
             # 更新消息历史
-            self._update_message_history(input, output, tool_calls, tool_results)
+            self._update_message_history(input, final_content, all_tool_calls, all_tool_results)
             
             # 构建执行结果
             result = ExecutionResult(
@@ -99,14 +109,14 @@ class Agent:
                 agent_id=self.config.id,
                 session_id=session_id,
                 input=input,
-                output=output,
-                messages=messages,
-                tool_calls=tool_calls,
-                tool_results=tool_results,
-                subagent_calls=[],  # TODO: 实现 subagent 调用
+                output=final_content or "I've completed processing but have no response to give.",
+                messages=final_messages,
+                tool_calls=all_tool_calls,
+                tool_results=all_tool_results,
+                subagent_calls=[],
                 metadata=ExecutionMetadata(
                     token_usage=TokenUsage(),  # TODO: 从模型响应获取
-                    iterations=1,
+                    iterations=len(all_tool_calls) + 1,
                     model=self.config.model.model,
                     temperature=self.config.temperature,
                 ),
@@ -120,6 +130,89 @@ class Agent:
         except Exception as e:
             self.status = AgentStatus.ERROR
             raise AgentExecutionError(f"Execution failed: {str(e)}")
+    
+    async def _run_react_loop(
+        self,
+        messages: List[Message],
+        max_iterations: int = 10,
+        on_progress: Optional[Callable[[str], Awaitable[None]]] = None
+    ) -> tuple[Optional[str], List[ToolCall], List[ToolResult], List[Message]]:
+        """
+        运行 ReAct 循环
+        
+        ReAct 范式核心：
+        1. 调用 LLM 获取响应（可能包含推理/思考内容）
+        2. 如果响应包含工具调用（Action），执行工具
+        3. 将工具结果（Observation）添加回消息历史
+        4. 继续循环直到没有工具调用或达到最大迭代次数
+        
+        Args:
+            messages: 初始消息列表
+            max_iterations: 最大迭代次数
+            on_progress: 进度回调
+            
+        Returns:
+            (final_content, all_tool_calls, all_tool_results, final_messages)
+        """
+        iteration = 0
+        final_content: Optional[str] = None
+        all_tool_calls: List[ToolCall] = []
+        all_tool_results: List[ToolResult] = []
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # 获取工具定义
+            tool_definitions = self._get_tool_definitions()
+            
+            # 调用模型
+            response = await self._call_model_with_tools(messages, tool_definitions)
+            
+            if response.has_tool_calls and response.tool_calls:
+                # Thought: 处理推理内容
+                thought = self._strip_think(response.content)
+                if thought and on_progress:
+                    await on_progress(thought)
+                
+                # Action: 添加助手消息（包含 tool_calls）
+                messages = self._add_assistant_message(
+                    messages, 
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                    reasoning_content=response.reasoning_content
+                )
+                
+                # 执行每个工具调用
+                for tool_call in response.tool_calls:
+                    all_tool_calls.append(tool_call)
+                    
+                    # 执行工具
+                    tool_result = await self._execute_tool(tool_call)
+                    all_tool_results.append(tool_result)
+                    
+                    # Observation: 添加工具结果到消息历史
+                    messages = self._add_tool_result_message(
+                        messages, tool_call.id, tool_call.name, tool_result
+                    )
+            else:
+                # 没有工具调用，任务完成
+                clean_content = self._strip_think(response.content)
+                messages = self._add_assistant_message(
+                    messages, 
+                    content=clean_content,
+                    reasoning_content=response.reasoning_content
+                )
+                final_content = clean_content
+                break
+        
+        # 如果达到最大迭代次数仍未完成
+        if final_content is None and iteration >= max_iterations:
+            final_content = (
+                f"I reached the maximum number of tool call iterations ({max_iterations}) "
+                "without completing the task. You can try breaking the task into smaller steps."
+            )
+        
+        return final_content, all_tool_calls, all_tool_results, messages
     
     async def stream(
         self,
@@ -143,7 +236,7 @@ class Agent:
             exec_context = self._create_execution_context(context, session_id)
             
             # 构建消息
-            messages = self._build_messages(input, exec_context)
+            messages = self._build_initial_messages(input, exec_context)
             
             # 流式调用模型
             async for chunk in self._call_model_stream(messages):
@@ -177,6 +270,41 @@ class Agent:
     def list_tools(self) -> List[Tool]:
         """列出所有工具"""
         return self._tool_registry.list()
+    
+    def _get_tool_definitions(self) -> List[Dict[str, Any]]:
+        """获取工具定义列表（用于 LLM 调用）"""
+        return [tool.to_dict() for tool in self.list_tools()]
+    
+    async def _execute_tool(self, tool_call: ToolCall) -> Any:
+        """
+        执行工具调用
+        
+        Args:
+            tool_call: 工具调用信息
+            
+        Returns:
+            工具执行结果
+        """
+        tool = self.get_tool(tool_call.name)
+        if not tool:
+            return f"Error: Tool '{tool_call.name}' not found"
+        
+        try:
+            from .types import ToolContext
+            tool_context = ToolContext(
+                agent=self,
+                session_id=str(uuid.uuid4()),  # TODO: 使用实际 session_id
+                memory=None  # TODO: 集成记忆系统
+            )
+            result = tool.execute(tool_call.arguments, tool_context)
+            
+            # 如果结果是协程，等待执行完成
+            if asyncio.iscoroutine(result):
+                result = await result
+                
+            return result
+        except Exception as e:
+            return f"Error executing tool '{tool_call.name}': {str(e)}"
     
     # ============================================
     # 上下文管理
@@ -250,12 +378,12 @@ class Agent:
             skills=skills,
         )
     
-    def _build_messages(
+    def _build_initial_messages(
         self,
         input: str,
         context: ExecutionContext
     ) -> List[Message]:
-        """构建消息列表"""
+        """构建初始消息列表"""
         messages: List[Message] = []
         
         # 系统提示
@@ -287,26 +415,59 @@ class Agent:
         if self.config.system_prompt:
             parts.append(self.config.system_prompt)
         
+        # 添加 ReAct 指导
+        parts.append("""
+You are an AI assistant that can use tools to help users. Follow the ReAct pattern:
+1. Think about what you need to do (Reasoning)
+2. Use available tools if needed (Action)
+3. Observe the results and continue if necessary (Observation)
+
+Available tools:""")
+        
         # 添加工具描述
         tools = self.list_tools()
         if tools:
-            parts.append("\nAvailable tools:")
             for tool in tools:
                 parts.append(f"- {tool.name}: {tool.description}")
         
         return "\n".join(parts)
     
-    async def _call_model(self, messages: List[Message]) -> str:
+    async def _call_model_with_tools(
+        self,
+        messages: List[Message],
+        tools: List[Dict[str, Any]]
+    ) -> ModelResponse:
         """
-        调用模型
+        调用模型（支持工具调用）
         
         TODO: 集成实际的 LLM API (OpenAI, Anthropic, etc.)
+        当前为模拟实现
         """
-        # 模拟模型调用
         await asyncio.sleep(0.1)
         
+        # 模拟模型响应
         last_message = messages[-1]
-        return f"Response to: {last_message.content}"
+        
+        # 简单模拟：如果用户消息包含特定关键词，返回工具调用
+        if "search" in last_message.content.lower() and tools:
+            return ModelResponse(
+                content="I'll search for that information.",
+                tool_calls=[
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        name="web_search",
+                        arguments={"query": last_message.content}
+                    )
+                ],
+                has_tool_calls=True,
+                finish_reason="tool_calls"
+            )
+        
+        return ModelResponse(
+            content=f"Response to: {last_message.content}",
+            has_tool_calls=False,
+            finish_reason="stop"
+        )
     
     async def _call_model_stream(
         self,
@@ -318,8 +479,8 @@ class Agent:
         TODO: 集成实际的 LLM API
         """
         # 模拟流式响应
-        response = await self._call_model(messages)
-        words = response.split()
+        response_text = f"Response to: {messages[-1].content}"
+        words = response_text.split()
         
         for word in words:
             await asyncio.sleep(0.05)
@@ -330,45 +491,58 @@ class Agent:
         
         yield StreamChunk(type="done")
     
-    async def _process_tools(
+    def _add_assistant_message(
         self,
-        response: str,
-        context: ExecutionContext
-    ) -> tuple[List[ToolCall], List[ToolResult]]:
-        """
-        处理工具调用
-        
-        TODO: 实现实际的工具调用解析和执行
-        """
-        # 模拟工具调用检测
-        tool_calls: List[ToolCall] = []
-        tool_results: List[ToolResult] = []
-        
-        # 这里应该解析模型响应中的工具调用请求
-        # 然后执行相应的工具
-        
-        return tool_calls, tool_results
+        messages: List[Message],
+        content: Optional[str] = None,
+        tool_calls: Optional[List[ToolCall]] = None,
+        reasoning_content: Optional[str] = None
+    ) -> List[Message]:
+        """添加助手消息到消息列表"""
+        messages.append(Message(
+            id=str(uuid.uuid4()),
+            role=MessageRole.ASSISTANT,
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
+            timestamp=datetime.now(),
+        ))
+        return messages
     
-    def _build_output(
+    def _add_tool_result_message(
         self,
-        response: str,
-        tool_results: List[ToolResult]
-    ) -> str:
-        """构建最终输出"""
-        output = response
+        messages: List[Message],
+        tool_call_id: str,
+        tool_name: str,
+        result: Any
+    ) -> List[Message]:
+        """添加工具结果消息到消息列表"""
+        result_str = str(result) if result is not None else ""
         
-        # 如果有工具结果，可以附加到输出中
-        if tool_results:
-            tool_outputs = []
-            for result in tool_results:
-                if result.error:
-                    tool_outputs.append(f"[Tool {result.name} failed: {result.error}]")
-                else:
-                    tool_outputs.append(f"[Tool {result.name} result: {result.result}]")
-            
-            output += "\n" + "\n".join(tool_outputs)
-        
-        return output
+        messages.append(Message(
+            id=str(uuid.uuid4()),
+            role=MessageRole.TOOL,
+            content=result_str,
+            timestamp=datetime.now(),
+            metadata={
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name
+            }
+        ))
+        return messages
+    
+    @staticmethod
+    def _strip_think(text: Optional[str]) -> Optional[str]:
+        """
+        移除 <think>...</think> 或 <thinking>...</thinking> 块
+        某些模型会在内容中嵌入推理块
+        """
+        if not text:
+            return None
+        # 移除 <think> 和 <thinking> 块
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+        text = re.sub(r"<thinking>[\s\S]*?</thinking>", "", text).strip()
+        return text or None
     
     def _update_message_history(
         self,
@@ -393,7 +567,6 @@ class Agent:
             content=output,
             timestamp=datetime.now(),
             tool_calls=tool_calls if tool_calls else None,
-            tool_results=tool_results if tool_results else None,
         ))
         
         # 限制历史长度
